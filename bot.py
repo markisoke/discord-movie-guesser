@@ -492,71 +492,75 @@ ntm = app_commands.Group(name="ntm", description="Name That Movie commands")
 
 @tasks.loop(minutes=1)
 async def scheduler():
+    now = datetime.now(timezone.utc).timestamp()
+    log.info("Scheduler tick at %s", datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M:%S"))
+
+    # ── Read phase: collect everything we need, then close the DB connection ──
     with get_db() as db:
         row = get_round(db)
         if not row or not row["active"]:
+            log.info("Scheduler: no active round, skipping")
             return
 
-        now      = datetime.now(timezone.utc).timestamp()
-        channel  = bot.get_channel(config.GAME_CHANNEL_ID)
+        channel = bot.get_channel(config.GAME_CHANNEL_ID)
         if channel is None:
             return
 
         lightning     = bool(row["lightning"])
         uploader_name = row["uploader_name"] or "Winner"
+        uploader_avatar = row["uploader_avatar"]
 
-        pending = db.execute(
-            "SELECT * FROM screenshots WHERE released=0 AND schedule_at <= ? ORDER BY schedule_at",
-            (now,)
-        ).fetchall()
+        # Fetch all pending shots and pre-compute their seq numbers
+        all_shots  = db.execute("SELECT * FROM screenshots ORDER BY schedule_at").fetchall()
+        total      = len(all_shots)
+        already_released = sum(1 for s in all_shots if s["released"])
+        pending    = [s for s in all_shots if not s["released"] and s["schedule_at"] <= now]
 
+        # Mark them released immediately so re-runs don't double-post
         for shot in pending:
-            total    = db.execute("SELECT COUNT(*) FROM screenshots").fetchone()[0]
-            released = db.execute("SELECT COUNT(*) FROM screenshots WHERE released=1").fetchone()[0]
-            seq      = released + 1
-
-            try:
-                await post_screenshot_as_user(
-                    channel=channel,
-                    local_path=shot["local_path"],
-                    seq=seq,
-                    total=total,
-                    uploader_name=uploader_name,
-                    uploader_avatar=row["uploader_avatar"],
-                    lightning=lightning,
-                )
-                log.info("Released screenshot %d/%d (lightning=%s)", seq, total, lightning)
-            except discord.Forbidden:
-                log.error("Webhook failed — missing Manage Webhooks permission in #%s", channel.name)
-                await channel.send(
-                    f"Screenshot {seq}/{total} - Name That Movie! (posted by {uploader_name})",
-                    file=discord.File(shot["local_path"]),
-                )
-            except Exception as e:
-                log.error("Failed to post screenshot %d: %s", seq, e)
-                await channel.send(
-                    f"Screenshot {seq}/{total} - Name That Movie! (posted by {uploader_name})",
-                    file=discord.File(shot["local_path"]),
-                )
-
             db.execute("UPDATE screenshots SET released=1 WHERE id=?", (shot["id"],))
-            db.execute("UPDATE round SET released=released+1 WHERE id=1")
+        if pending:
+            db.execute("UPDATE round SET released=released+? WHERE id=1", (len(pending),))
 
-        # Auto-reveal
-        row       = get_round(db)
-        reveal_at = row["reveal_at"]
-        if reveal_at and now >= reveal_at and row["active"]:
-            all_released = db.execute(
-                "SELECT COUNT(*) FROM screenshots WHERE released=0"
-            ).fetchone()[0] == 0
-            if all_released:
-                log.info("Auto-reveal triggered for movie: %r", row["movie"])
-                recap = end_round(db, solved=False, winner_id=None, winner_name=None)
+        # Check auto-reveal (re-read row after updates)
+        row2      = get_round(db)
+        reveal_at = row2["reveal_at"]
+        do_reveal = (
+            reveal_at and now >= reveal_at and row2["active"]
+            and db.execute("SELECT COUNT(*) FROM screenshots WHERE released=0").fetchone()[0] == 0
+            and not pending  # don't reveal same tick we post the last screenshot
+        )
+        recap = end_round(db, solved=False, winner_id=None, winner_name=None) if do_reveal else None
 
-        else:
-            recap = None
+    # ── Post phase: all Discord I/O happens outside the DB transaction ─────────
+    for i, shot in enumerate(pending):
+        seq = already_released + i + 1
+        try:
+            await post_screenshot_as_user(
+                channel=channel,
+                local_path=shot["local_path"],
+                seq=seq,
+                total=total,
+                uploader_name=uploader_name,
+                uploader_avatar=uploader_avatar,
+                lightning=lightning,
+            )
+            log.info("Released screenshot %d/%d (lightning=%s)", seq, total, lightning)
+        except discord.Forbidden:
+            log.error("Webhook failed — missing Manage Webhooks permission in #%s", channel.name)
+            await channel.send(
+                f"Screenshot {seq}/{total} - Name That Movie! (posted by {uploader_name})",
+                file=discord.File(shot["local_path"]),
+            )
+        except Exception as e:
+            log.error("Failed to post screenshot %d: %s", seq, e)
+            await channel.send(
+                f"Screenshot {seq}/{total} - Name That Movie! (posted by {uploader_name})",
+                file=discord.File(shot["local_path"]),
+            )
 
     if recap:
+        log.info("Auto-reveal triggered for movie: %r", recap["movie"])
         await post_round_recap(
             channel=channel,
             movie=recap["movie"],
@@ -569,9 +573,9 @@ async def scheduler():
             screenshot_paths=recap["shot_paths"],
             wrong_guessers=recap.get("wrong_guessers"),
         )
-        uploader_name = recap["uploader_name"] or "the previous setter"
+        free_game_name = recap["uploader_name"] or "the previous setter"
         await channel.send(
-            f"🆓 **Free game!** Since nobody guessed it, anyone except **{uploader_name}** "
+            f"🆓 **Free game!** Since nobody guessed it, anyone except **{free_game_name}** "
             f"can start the next round with `/ntm movie`.\n"
             f"An admin can use `/ntm winner @user` to assign the Winner role first if needed."
         )
@@ -671,19 +675,30 @@ async def weekly_summary():
 
 @bot.event
 async def on_ready():
-    init_db()
-    guild  = discord.Object(id=config.GUILD_ID)
-    bot.tree.add_command(ntm, guild=guild)
-    synced = await bot.tree.sync(guild=guild)
-    g      = bot.get_guild(config.GUILD_ID)
-    if g:
-        await g.chunk()
-    scheduler.start()
-    weekly_summary.start()
-    log.info("Bot ready as %s — synced %d slash commands to guild %d",
-             bot.user, len(synced), config.GUILD_ID)
-    if not g:
-        log.warning("Guild %d not found — check GUILD_ID in .env", config.GUILD_ID)
+    try:
+        log.info("on_ready fired — bot user: %s", bot.user)
+        init_db()
+        log.info("DB initialised OK")
+        guild  = discord.Object(id=config.GUILD_ID)
+        bot.tree.add_command(ntm, guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info("Synced %d slash commands", len(synced))
+        if not scheduler.is_running():
+            scheduler.start()
+            log.info("Scheduler started")
+        if not weekly_summary.is_running():
+            weekly_summary.start()
+            log.info("Weekly summary started")
+        g = bot.get_guild(config.GUILD_ID)
+        if g:
+            bot.loop.create_task(g.chunk())
+            log.info("Guild chunk requested in background")
+        log.info("Bot ready as %s — synced %d slash commands to guild %d",
+                 bot.user, len(synced), config.GUILD_ID)
+        if not g:
+            log.warning("Guild %d not found — check GUILD_ID in .env", config.GUILD_ID)
+    except Exception:
+        log.exception("FATAL: on_ready crashed")
 
 
 # ── /ntm guess ────────────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ WINNER_ROLE_NAME: str = os.environ.get("WINNER_ROLE_NAME", "Winner")
 # ── Game timing ───────────────────────────────────────────────────────────────
 
 # Hours between each screenshot release in a normal round
-SCREENSHOT_INTERVAL_HOURS: int = 8
+SCREENSHOT_INTERVAL_HOURS: int = 5/60
 
 # Hours after the last screenshot before auto-reveal in a normal round
 REVEAL_AFTER_HOURS: int = 48
