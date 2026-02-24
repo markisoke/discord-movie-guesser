@@ -82,16 +82,6 @@ docker logs namethatmovie-bot --tail 50
 docker logs namethatmovie-bot --follow   # live stream
 ```
 
-#### On Unraid
-
-If your bot files are in `/mnt/user/appdata/namethatmovie-bot/`:
-
-```bash
-cd /mnt/user/appdata/namethatmovie-bot
-docker compose up -d --build
-docker logs namethatmovie-bot --follow
-```
-
 ---
 
 ## How a Round Works
