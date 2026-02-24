@@ -93,9 +93,10 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS movie_usage (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                movie       TEXT NOT NULL,
-                played_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                movie         TEXT NOT NULL,
+                uploader_name TEXT,
+                played_at     TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             INSERT OR IGNORE INTO round(id, active) VALUES(1, 0);
@@ -126,6 +127,11 @@ def init_db():
             if col not in hist_cols:
                 db.execute(f"ALTER TABLE history ADD COLUMN {col} {typedef}")
                 log.info("Migrated DB: added column history.%s", col)
+
+        usage_cols = {row[1] for row in db.execute("PRAGMA table_info(movie_usage)")}
+        if "uploader_name" not in usage_cols:
+            db.execute("ALTER TABLE movie_usage ADD COLUMN uploader_name TEXT")
+            log.info("Migrated DB: added column movie_usage.uploader_name")
 
         lb_cols = {row[1] for row in db.execute("PRAGMA table_info(leaderboard)")}
         for col, typedef in [
@@ -683,7 +689,7 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
             "INSERT INTO screenshots(local_path, schedule_at, released) VALUES(?,?,1)",
             (str(path), now),
         )
-        db.execute("INSERT INTO movie_usage(movie) VALUES(?)", (title,))
+        db.execute("INSERT INTO movie_usage(movie, uploader_name) VALUES(?,?)", (title, uploader_name))
         db.execute(
             "UPDATE round SET active=1, movie=?, uploader_id=?, uploader_name=?, "
             "uploader_avatar=?, released=1, reveal_at=NULL, round_number=?, lightning=?, guess_count=0 WHERE id=1",
@@ -891,7 +897,8 @@ async def ntm_currentcheck(interaction: discord.Interaction):
 async def ntm_usagecheck(interaction: discord.Interaction, title: str):
     with get_db() as db:
         rows = db.execute(
-            "SELECT played_at FROM movie_usage WHERE lower(movie)=lower(?) ORDER BY played_at",
+            "SELECT uploader_name, played_at FROM movie_usage "
+            "WHERE lower(movie)=lower(?) ORDER BY played_at",
             (title,)
         ).fetchall()
 
@@ -900,9 +907,15 @@ async def ntm_usagecheck(interaction: discord.Interaction, title: str):
             f"**{title}** has never been used in Name That Movie.", ephemeral=True
         )
     else:
-        dates = "\n".join(f"- {r['played_at'][:10]}" for r in rows)
+        lines = []
+        for r in rows:
+            who  = r["uploader_name"] or "Unknown"
+            date = r["played_at"][:10]
+            lines.append(f"- **{who}** on {date}")
+        times = f"{len(rows)} time" if len(rows) == 1 else f"{len(rows)} times"
         await interaction.response.send_message(
-            f"**{title}** has been used **{len(rows)} time(s)**:\n{dates}", ephemeral=True
+            f"**{title}** has been used **{times}**:\n" + "\n".join(lines),
+            ephemeral=True,
         )
 
 
