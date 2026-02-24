@@ -57,7 +57,7 @@ cp .env.example .env
 To get IDs: Enable Developer Mode in Discord (User Settings → Advanced),
 then right-click a server or channel and choose **Copy ID**.
 
-Game settings (timings, lightning rounds, retention, leaderboard size) are in `config.py`.
+Game settings (timings, lightning rounds, weekly summary, etc.) are in `config.py`.
 
 ---
 
@@ -89,11 +89,11 @@ docker logs namethatmovie-bot --follow   # live stream
 1. The current `Winner` runs `/ntm movie The Dark Knight` with **screenshot 1 attached**.
    - Screenshot 1 is posted immediately via webhook, appearing as if sent by the winner.
    - The winner receives an ephemeral confirmation with timing details.
-   - A public message is posted once all 3 screenshots have been uploaded confirming the
-     drop times for screenshots 2 and 3.
 2. The winner runs `/ntm screenshot` twice to upload screenshots 2 and 3.
-   - Each is scheduled automatically and released by the bot.
+   - A public message is posted once all 3 are uploaded, showing when each will drop.
+   - Each screenshot is released automatically by the bot on its scheduled time.
 3. Players type `/ntm guess <title>` to submit guesses (case-insensitive).
+   - Wrong guesses are tracked and shown in the recap at the end of the round.
 4. The first correct guess wins — the guesser earns points and gets the `Winner` role.
 5. If nobody guesses in time, the bot auto-reveals the answer, posts a recap, and opens
    a **free game** — anyone except the person who set the movie can start the next round.
@@ -126,6 +126,10 @@ the **Winner** (and therefore cannot guess) are skipped — your streak is froze
 those rounds and neither increments nor resets. This means a streak reflects pure
 guessing performance, regardless of how often you set movies.
 
+When a player hits the configured streak threshold, the bot publicly calls it out with
+a random announcement message. Toggle this with `HOT_STREAK_ENABLED` and set the
+minimum streak with `HOT_STREAK_THRESHOLD`.
+
 ---
 
 ## ⚡ Lightning Rounds
@@ -141,11 +145,15 @@ Each round has a **5% chance** of being a lightning round (configurable, or disa
 ## Round Recap
 
 At the end of every round — whether solved, timed out, skipped, or admin-ended — the bot
-posts a recap embed showing the movie title, who guessed it, which screenshot it was
-solved on, points awarded, and total guesses made, followed by all available screenshots.
+posts a recap embed showing:
+- The movie title and who guessed it (or a random funny message if nobody did)
+- Which screenshot it was solved on and points awarded
+- Total guesses made
+- Up to `MAX_WRONG_GUESSES_SHOWN` unique players who guessed incorrectly
+- All available screenshots
 
-If nobody guessed the movie, one of 22 randomly chosen funny messages is posted instead
-of a plain "nobody guessed it" line.
+If nobody guessed the movie, one of 22 randomly chosen funny messages is shown and the
+setter earns +1 point.
 
 ---
 
@@ -160,6 +168,29 @@ Admins can always start a round regardless of free game rules.
 
 ---
 
+## 📊 Weekly Summary
+
+Every Monday at 09:00 UTC (configurable), the bot posts a weekly summary in the game
+channel covering the previous week's activity:
+- Rounds played
+- Top guesser (most wins that week)
+- Top stumper (most unsolved movies set)
+- Hardest movie (most total guesses)
+- Fastest guess (solved on earliest screenshot)
+
+Toggle with `WEEKLY_SUMMARY_ENABLED`. Change the day and time with `WEEKLY_SUMMARY_DAY`
+and `WEEKLY_SUMMARY_HOUR`.
+
+---
+
+## 🗓️ Monthly Leaderboard
+
+A separate leaderboard resets on the 1st of each month, giving everyone a fresh shot at
+the top regardless of all-time history. View it with `/ntm monthly`. Toggle with
+`MONTHLY_LEADERBOARD_ENABLED`.
+
+---
+
 ## Command Reference
 
 | Command | Who | Description |
@@ -169,10 +200,11 @@ Admins can always start a round regardless of free game rules.
 | `/ntm screenshot` + image | Winner / Admin | Add screenshot 2 or 3 |
 | `/ntm skip` | Winner / Admin | Give up and reveal the answer early |
 | `/ntm currentcheck` | Winner / Admin | Privately see the current movie title and guess count |
-| `/ntm usagecheck [title]` | Anyone | Check how many times a movie has been used |
+| `/ntm usagecheck [title]` | Anyone | Check how many times a movie has been used and by whom |
 | `/ntm last` | Anyone | Post all screenshots from the previous round |
 | `/ntm repost` | Anyone | Repost currently revealed screenshots |
 | `/ntm leaders` | Anyone | All-time leaderboard with points, streaks and toughest movie |
+| `/ntm monthly` | Anyone | This month's leaderboard |
 | `/ntm stats [@user]` | Anyone | Personal stats for yourself or another player |
 | `/ntm help` | Anyone | How to play |
 | `/ntm winner @user` | Admin | Force-end the current round and assign a new winner |
@@ -183,6 +215,7 @@ Admins can always start a round regardless of free game rules.
 ## Configuration Files
 
 **`.env`** — secrets and Discord IDs (never commit this):
+
 | Variable | Description |
 |---|---|
 | `DISCORD_TOKEN` | Bot token |
@@ -191,6 +224,7 @@ Admins can always start a round regardless of free game rules.
 | `WINNER_ROLE_NAME` | Role name for the current winner (default: `Winner`) |
 
 **`config.py`** — game settings (safe to commit):
+
 | Variable | Default | Description |
 |---|---|---|
 | `SCREENSHOT_INTERVAL_HOURS` | `8` | Hours between screenshot releases in a normal round |
@@ -199,5 +233,12 @@ Admins can always start a round regardless of free game rules.
 | `LIGHTNING_ROUND_PROBABILITY` | `0.05` | Chance per round of it being a lightning round (0.05 = 5%) |
 | `LIGHTNING_INTERVAL_HOURS` | `0.5` | Hours between screenshots in a lightning round (0.5 = 30 min) |
 | `LIGHTNING_REVEAL_HOURS` | `2` | Hours after last screenshot before auto-reveal in a lightning round |
+| `HOT_STREAK_ENABLED` | `True` | Publicly announce when a player hits a hot streak |
+| `HOT_STREAK_THRESHOLD` | `3` | Minimum streak length before a public announcement is made |
+| `WEEKLY_SUMMARY_ENABLED` | `True` | Post a weekly summary in the game channel |
+| `WEEKLY_SUMMARY_DAY` | `0` | Day to post the summary (0 = Monday, 6 = Sunday) |
+| `WEEKLY_SUMMARY_HOUR` | `9` | Hour to post the summary (24h UTC) |
+| `MONTHLY_LEADERBOARD_ENABLED` | `True` | Track a separate monthly leaderboard |
+| `MAX_WRONG_GUESSES_SHOWN` | `5` | Max unique wrong guessers shown in the recap (0 to disable) |
 | `SCREENSHOT_RETENTION_ROUNDS` | `2` | How many rounds of screenshots to keep on disk |
-| `LEADERBOARD_SIZE` | `10` | Number of players shown in `/ntm leaders` |
+| `LEADERBOARD_SIZE` | `10` | Number of players shown on leaderboards |
