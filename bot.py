@@ -52,7 +52,8 @@ def init_db():
                 round_number    INTEGER NOT NULL DEFAULT 0,
                 lightning       INTEGER NOT NULL DEFAULT 0,
                 guess_count     INTEGER NOT NULL DEFAULT 0,
-                last_uploader_id INTEGER
+                last_uploader_id INTEGER,
+                round_id         INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -99,6 +100,25 @@ def init_db():
                 played_at     TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS wrong_guesses (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                username    TEXT NOT NULL,
+                guess       TEXT NOT NULL,
+                guessed_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(round_id, user_id, guess)
+            );
+
+            CREATE TABLE IF NOT EXISTS monthly_leaderboard (
+                user_id     INTEGER NOT NULL,
+                username    TEXT NOT NULL,
+                year_month  TEXT NOT NULL,
+                wins        INTEGER NOT NULL DEFAULT 0,
+                points      INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, year_month)
+            );
+
             INSERT OR IGNORE INTO round(id, active) VALUES(1, 0);
         """)
 
@@ -111,6 +131,7 @@ def init_db():
             ("lightning",       "INTEGER NOT NULL DEFAULT 0"),
             ("guess_count",     "INTEGER NOT NULL DEFAULT 0"),
             ("last_uploader_id", "INTEGER"),
+            ("round_id",         "INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in round_cols:
                 db.execute(f"ALTER TABLE round ADD COLUMN {col} {typedef}")
@@ -245,6 +266,7 @@ async def post_round_recap(
     solved_on: Optional[int],
     screenshot_paths: list,
     skipped: bool = False,
+    wrong_guessers: Optional[list] = None,
 ):
     """Post an end-of-round recap embed with all screenshots."""
     if skipped:
@@ -293,6 +315,13 @@ async def post_round_recap(
     if uploader_name:
         lines.append(f"📽️ Set by **{uploader_name}**")
     lines.append(f"💬 Total guesses made: **{guess_count}**")
+    if wrong_guessers and config.MAX_WRONG_GUESSES_SHOWN > 0:
+        shown   = wrong_guessers[:config.MAX_WRONG_GUESSES_SHOWN]
+        extra   = len(wrong_guessers) - len(shown)
+        names   = ", ".join(f"**{n}**" for n in shown)
+        if extra:
+            names += f" (+{extra} more)"
+        lines.append(f"❌ Wrong guessers: {names}")
 
     embed = discord.Embed(title=title, description="\n".join(lines), color=color)
     embed.set_footer(text="Use /ntm leaders to see the leaderboard")
@@ -343,10 +372,17 @@ def end_round(
     if not row or not row["active"]:
         return {}
 
-    guess_count  = row["guess_count"]
-    uploader_id  = row["uploader_id"]
+    guess_count   = row["guess_count"]
+    uploader_id   = row["uploader_id"]
     uploader_name = row["uploader_name"]
-    movie        = row["movie"]
+    movie         = row["movie"]
+    round_id      = row["round_id"]
+
+    # Fetch wrong guessers before clearing
+    wrong_guessers = db.execute(
+        "SELECT DISTINCT username FROM wrong_guesses WHERE round_id=? ORDER BY guessed_at",
+        (round_id,)
+    ).fetchall()
 
     log.info("Round ending — movie: %r  solved: %s  winner: %s  guesses: %d",
              movie, solved, winner_name or "nobody", guess_count)
@@ -382,6 +418,15 @@ def end_round(
             "best_streak=MAX(best_streak, current_streak+1)",
             (winner_id, winner_name, points, points),
         )
+        # Monthly leaderboard
+        if config.MONTHLY_LEADERBOARD_ENABLED:
+            ym = datetime.now(timezone.utc).strftime("%Y-%m")
+            db.execute(
+                "INSERT INTO monthly_leaderboard(user_id, username, year_month, wins, points) "
+                "VALUES(?,?,?,1,?) ON CONFLICT(user_id, year_month) DO UPDATE SET "
+                "wins=wins+1, points=points+?, username=excluded.username",
+                (winner_id, winner_name, ym, points, points),
+            )
         # Reset streaks for everyone except the winner AND the uploader
         # (uploader's streak is frozen while they are setting movies)
         db.execute(
@@ -408,25 +453,28 @@ def end_round(
             db.execute("UPDATE leaderboard SET current_streak=0")
 
     db.execute("DELETE FROM screenshots")
+    db.execute("DELETE FROM wrong_guesses WHERE round_id=?", (round_id,))
+    new_round_id = round_id + 1
     db.execute(
         "UPDATE round SET active=0, movie=NULL, uploader_id=NULL, uploader_name=NULL, "
         "uploader_avatar=NULL, released=0, reveal_at=NULL, lightning=0, guess_count=0, "
-        "last_uploader_id=? WHERE id=1",
-        (uploader_id,)
+        "last_uploader_id=?, round_id=? WHERE id=1",
+        (uploader_id, new_round_id)
     )
     purge_old_screenshots(db)
 
     return {
-        "movie":         movie,
-        "uploader_id":   uploader_id,
-        "uploader_name": uploader_name,
-        "winner_name":   winner_name,
-        "solved":        solved,
-        "solved_on":     solved_on_screenshot,
-        "points":        points,
-        "guess_count":   guess_count,
-        "shot_paths":    shot_paths,
-        "skipped":       skipped,
+        "movie":           movie,
+        "uploader_id":     uploader_id,
+        "uploader_name":   uploader_name,
+        "winner_name":     winner_name,
+        "solved":          solved,
+        "solved_on":       solved_on_screenshot,
+        "points":          points,
+        "guess_count":     guess_count,
+        "shot_paths":      shot_paths,
+        "skipped":         skipped,
+        "wrong_guessers":  [r["username"] for r in wrong_guessers],
     }
 
 
@@ -519,6 +567,7 @@ async def scheduler():
             guess_count=recap["guess_count"],
             solved_on=None,
             screenshot_paths=recap["shot_paths"],
+            wrong_guessers=recap.get("wrong_guessers"),
         )
         uploader_name = recap["uploader_name"] or "the previous setter"
         await channel.send(
@@ -526,6 +575,96 @@ async def scheduler():
             f"can start the next round with `/ntm movie`.\n"
             f"An admin can use `/ntm winner @user` to assign the Winner role first if needed."
         )
+
+
+# ── Weekly summary scheduler ─────────────────────────────────────────────────
+
+@tasks.loop(minutes=1)
+async def weekly_summary():
+    if not config.WEEKLY_SUMMARY_ENABLED:
+        return
+    now = datetime.now(timezone.utc)
+    if now.weekday() != config.WEEKLY_SUMMARY_DAY or now.hour != config.WEEKLY_SUMMARY_HOUR or now.minute != 0:
+        return
+
+    channel = bot.get_channel(config.GAME_CHANNEL_ID)
+    if not channel:
+        return
+
+    # Calculate start of last week (Monday 00:00 UTC)
+    days_since_monday = now.weekday()
+    week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    week_start -= timedelta(days=days_since_monday + 7)
+    week_end   = week_start + timedelta(days=7)
+    ws = week_start.strftime("%Y-%m-%d")
+    we = week_end.strftime("%Y-%m-%d")
+
+    with get_db() as db:
+        rounds_played = db.execute(
+            "SELECT COUNT(*) as c FROM history WHERE played_at >= ? AND played_at < ?", (ws, we)
+        ).fetchone()["c"]
+
+        if rounds_played == 0:
+            return  # No activity last week, skip
+
+        top_guesser = db.execute(
+            "SELECT winner_name, COUNT(*) as wins FROM history "
+            "WHERE solved=1 AND winner_name IS NOT NULL AND played_at >= ? AND played_at < ? "
+            "GROUP BY winner_id ORDER BY wins DESC LIMIT 1", (ws, we)
+        ).fetchone()
+
+        top_setter = db.execute(
+            "SELECT uploader_name, COUNT(*) as stumps FROM history "
+            "WHERE solved=0 AND uploader_name IS NOT NULL AND played_at >= ? AND played_at < ? "
+            "GROUP BY uploader_id ORDER BY stumps DESC LIMIT 1", (ws, we)
+        ).fetchone()
+
+        hardest = db.execute(
+            "SELECT movie, uploader_name, guess_count FROM history "
+            "WHERE played_at >= ? AND played_at < ? ORDER BY guess_count DESC LIMIT 1", (ws, we)
+        ).fetchone()
+
+        fastest = db.execute(
+            "SELECT movie, winner_name, solved_on_screenshot FROM history "
+            "WHERE solved=1 AND played_at >= ? AND played_at < ? "
+            "ORDER BY solved_on_screenshot ASC, guess_count ASC LIMIT 1", (ws, we)
+        ).fetchone()
+
+    embed = discord.Embed(
+        title=f"📊 Weekly Summary — {week_start.strftime('%b %d')} to {week_end.strftime('%b %d')}",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="🎬 Rounds Played", value=str(rounds_played), inline=True)
+
+    if top_guesser:
+        embed.add_field(
+            name="🏆 Top Guesser",
+            value=f"**{top_guesser['winner_name']}** ({top_guesser['wins']} wins)",
+            inline=True,
+        )
+    if top_setter:
+        embed.add_field(
+            name="😈 Top Stumper",
+            value=f"**{top_setter['uploader_name']}** ({top_setter['stumps']} unsolved)",
+            inline=True,
+        )
+    if hardest:
+        embed.add_field(
+            name="🧠 Hardest Movie",
+            value=f"**{hardest['movie']}** by {hardest['uploader_name']} ({hardest['guess_count']} guesses)",
+            inline=False,
+        )
+    if fastest:
+        embed.add_field(
+            name="⚡ Fastest Guess",
+            value=f"**{fastest['winner_name']}** got **{fastest['movie']}** on screenshot {fastest['solved_on_screenshot']}",
+            inline=False,
+        )
+
+    embed.set_footer(text="See /ntm leaders for the all-time leaderboard")
+    await channel.send(embed=embed)
+    log.info("Weekly summary posted for week of %s", ws)
 
 
 # ── Events ────────────────────────────────────────────────────────────────────
@@ -540,6 +679,7 @@ async def on_ready():
     if g:
         await g.chunk()
     scheduler.start()
+    weekly_summary.start()
     log.info("Bot ready as %s — synced %d slash commands to guild %d",
              bot.user, len(synced), config.GUILD_ID)
     if not g:
@@ -576,6 +716,12 @@ async def ntm_guess(interaction: discord.Interaction, title: str):
         db.execute("UPDATE round SET guess_count=guess_count+1 WHERE id=1")
 
         if normalize(title) != normalize(row["movie"]):
+            # Track unique wrong guessers for the recap
+            db.execute(
+                "INSERT OR IGNORE INTO wrong_guesses(round_id, user_id, username, guess) "
+                "VALUES(?,?,?,?)",
+                (row["round_id"], winner.id, winner.display_name, title),
+            )
             await interaction.response.send_message(
                 f"Sorry, **{title}** is not correct. Keep guessing!", ephemeral=True
             )
@@ -614,7 +760,25 @@ async def ntm_guess(interaction: discord.Interaction, title: str):
             guess_count=recap["guess_count"],
             solved_on=solved_on,
             screenshot_paths=recap["shot_paths"],
+            wrong_guessers=recap.get("wrong_guessers"),
         )
+        # Hot streak announcement
+        if config.HOT_STREAK_ENABLED:
+            with get_db() as db:
+                streak_row = db.execute(
+                    "SELECT current_streak FROM leaderboard WHERE user_id=?",
+                    (winner.id,)
+                ).fetchone()
+            streak = streak_row["current_streak"] if streak_row else 0
+            if streak >= config.HOT_STREAK_THRESHOLD:
+                streak_msgs = [
+                    f"🔥 **{winner.display_name}** is on a **{streak}-game streak** — can anyone stop them?",
+                    f"🔥 {streak} in a row for **{winner.display_name}**! They're absolutely on fire!",
+                    f"🔥 **{winner.display_name}** keeps delivering! That's {streak} straight wins!",
+                    f"🔥 Someone please stop **{winner.display_name}** — {streak} wins in a row now!",
+                    f"🔥 **{winner.display_name}** is unstoppable. {streak}-game streak and counting!",
+                ]
+                await channel.send(random.choice(streak_msgs))
 
 
 # ── /ntm movie ────────────────────────────────────────────────────────────────
@@ -863,6 +1027,7 @@ async def ntm_skip(interaction: discord.Interaction):
             solved_on=None,
             screenshot_paths=recap["shot_paths"],
             skipped=True,
+            wrong_guessers=recap.get("wrong_guessers"),
         )
 
 
@@ -1057,6 +1222,48 @@ async def ntm_leaders(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ── /ntm monthly ─────────────────────────────────────────────────────────────
+
+@ntm.command(name="monthly", description="Show this month's Name That Movie leaderboard.")
+async def ntm_monthly(interaction: discord.Interaction):
+    if not config.MONTHLY_LEADERBOARD_ENABLED:
+        await interaction.response.send_message(
+            "Monthly leaderboard is not enabled.", ephemeral=True
+        )
+        return
+
+    ym = datetime.now(timezone.utc).strftime("%Y-%m")
+    month_label = datetime.now(timezone.utc).strftime("%B %Y")
+
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT username, wins, points FROM monthly_leaderboard "
+            "WHERE year_month=? ORDER BY points DESC, wins DESC LIMIT ?",
+            (ym, config.LEADERBOARD_SIZE)
+        ).fetchall()
+
+    if not rows:
+        await interaction.response.send_message(
+            f"No wins recorded yet this month ({month_label}). Start guessing!",
+            ephemeral=True,
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = []
+    for i, r in enumerate(rows):
+        medal = medals[i] if i < 3 else f"**{i + 1}.**"
+        lines.append(f"{medal} **{r['username']}** — {r['points']} pts · {r['wins']} win(s)")
+
+    embed = discord.Embed(
+        title=f"Name That Movie — {month_label} Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Resets on the 1st of each month · /ntm leaders for all-time")
+    await interaction.response.send_message(embed=embed)
+
+
 # ── /ntm stats ────────────────────────────────────────────────────────────────
 
 @ntm.command(name="stats", description="Show stats for yourself or another player.")
@@ -1166,6 +1373,7 @@ async def ntm_winner(interaction: discord.Interaction, member: discord.Member):
                 guess_count=recap["guess_count"],
                 solved_on=None,
                 screenshot_paths=recap["shot_paths"],
+                wrong_guessers=recap.get("wrong_guessers"),
             )
 
 
@@ -1221,12 +1429,14 @@ async def ntm_reset(interaction: discord.Interaction):
             DELETE FROM history_screenshots;
             DELETE FROM history;
             DELETE FROM leaderboard;
+            DELETE FROM monthly_leaderboard;
             DELETE FROM movie_usage;
             DELETE FROM screenshots;
+            DELETE FROM wrong_guesses;
             UPDATE round SET
                 active=0, movie=NULL, uploader_id=NULL, uploader_name=NULL,
                 uploader_avatar=NULL, released=0, reveal_at=NULL,
-                round_number=0, lightning=0, guess_count=0
+                round_number=0, lightning=0, guess_count=0, round_id=0
             WHERE id=1;
         """)
 
@@ -1289,6 +1499,7 @@ async def ntm_help(interaction: discord.Interaction):
             "`/ntm repost` — Repost currently revealed screenshots\n"
             "`/ntm leaders` — All-time leaderboard\n"
             "`/ntm stats` — Personal stats\n"
+            "`/ntm monthly` — This month's leaderboard\n"
             "`/ntm reset` — Wipe all data (Admin only)\n"
             "`/ntm help` — This message"
         ),

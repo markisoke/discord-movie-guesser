@@ -31,6 +31,36 @@ LIGHTNING_INTERVAL_HOURS: float = 0.5
 # Hours after last screenshot before auto-reveal in a lightning round
 LIGHTNING_REVEAL_HOURS: int = 2
 
+# ── Hot streak announcements ──────────────────────────────────────────────────
+
+# Set to True to publicly announce when a player hits a hot streak
+HOT_STREAK_ENABLED: bool = True
+
+# Minimum streak length before a public announcement is made
+HOT_STREAK_THRESHOLD: int = 3
+
+# ── Weekly summary ────────────────────────────────────────────────────────────
+
+# Set to True to post a weekly summary in the game channel
+WEEKLY_SUMMARY_ENABLED: bool = True
+
+# Day of week to post the summary (0 = Monday, 6 = Sunday)
+WEEKLY_SUMMARY_DAY: int = 0  # Monday
+
+# Hour of day to post the summary (24h UTC)
+WEEKLY_SUMMARY_HOUR: int = 9  # 09:00 UTC
+
+# ── Monthly leaderboard ───────────────────────────────────────────────────────
+
+# Set to True to track a separate monthly leaderboard
+MONTHLY_LEADERBOARD_ENABLED: bool = True
+
+# ── Recap wrong guesses ───────────────────────────────────────────────────────
+
+# Maximum number of unique wrong guessers to list in the recap
+# Set to 0 to disable the wrong guesser list entirely
+MAX_WRONG_GUESSES_SHOWN: int = 5
+
 # ── Screenshot retention ──────────────────────────────────────────────────────
 
 # How many completed rounds worth of screenshots to keep on disk
