@@ -1,0 +1,11 @@
+# Secret credentials — never commit this
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS junk
+.DS_Store
+Thumbs.db
