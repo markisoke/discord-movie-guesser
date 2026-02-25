@@ -53,7 +53,13 @@ def init_db():
                 lightning       INTEGER NOT NULL DEFAULT 0,
                 guess_count     INTEGER NOT NULL DEFAULT 0,
                 last_uploader_id INTEGER,
-                round_id         INTEGER NOT NULL DEFAULT 0
+                round_id         INTEGER NOT NULL DEFAULT 0,
+                uploaded_msg_id  INTEGER,
+                countdown_msg_id INTEGER,
+                started_at       REAL,
+                winner_deadline  REAL,
+                pending_winner_id INTEGER,
+                instructions_msg_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -132,6 +138,12 @@ def init_db():
             ("guess_count",     "INTEGER NOT NULL DEFAULT 0"),
             ("last_uploader_id", "INTEGER"),
             ("round_id",         "INTEGER NOT NULL DEFAULT 0"),
+            ("uploaded_msg_id",  "INTEGER"),
+            ("countdown_msg_id", "INTEGER"),
+            ("started_at",        "REAL"),
+            ("winner_deadline",   "REAL"),
+            ("pending_winner_id", "INTEGER"),
+            ("instructions_msg_id", "INTEGER"),
         ]:
             if col not in round_cols:
                 db.execute(f"ALTER TABLE round ADD COLUMN {col} {typedef}")
@@ -261,13 +273,16 @@ async def post_round_recap(
     solved: bool,
     winner_name: Optional[str],
     uploader_name: Optional[str],
-    points: int,
-    guess_count: int,
-    solved_on: Optional[int],
-    screenshot_paths: list,
+    uploader_avatar: Optional[str] = None,
+    points: int = 0,
+    guess_count: int = 0,
+    solved_on: Optional[int] = None,
+    screenshot_paths: list = None,
     skipped: bool = False,
     wrong_guessers: Optional[list] = None,
 ):
+    if screenshot_paths is None:
+        screenshot_paths = []
     """Post an end-of-round recap embed with all screenshots."""
     if skipped:
         color       = discord.Color.orange()
@@ -328,13 +343,23 @@ async def post_round_recap(
 
     await channel.send(embed=embed)
 
-    # Post any available screenshots as a gallery
+    # Post any available screenshots as a gallery via webhook so they appear from the setter
     available = [p for p in screenshot_paths if Path(p).exists()]
     for i, p in enumerate(available):
-        await channel.send(
-            f"Screenshot {i + 1}/{len(screenshot_paths)}:",
-            file=discord.File(p),
-        )
+        try:
+            await post_screenshot_as_user(
+                channel=channel,
+                local_path=p,
+                seq=i + 1,
+                total=len(screenshot_paths),
+                uploader_name=uploader_name or "Winner",
+                uploader_avatar=uploader_avatar,
+            )
+        except Exception:
+            await channel.send(
+                f"Screenshot {i + 1}/{len(screenshot_paths)}:",
+                file=discord.File(p),
+            )
 
 
 def purge_old_screenshots(db: sqlite3.Connection):
@@ -358,6 +383,20 @@ def purge_old_screenshots(db: sqlite3.Connection):
         )
 
 
+async def delete_instructions_msg(channel: discord.TextChannel):
+    """Delete the round instructions message if it exists."""
+    with get_db() as db:
+        row = get_round(db)
+        msg_id = row["instructions_msg_id"] if row else None
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.delete()
+            log.info("Deleted instructions message")
+        except Exception as e:
+            log.warning("Could not delete instructions message: %s", e)
+
+
 def end_round(
     db: sqlite3.Connection,
     solved: bool,
@@ -372,11 +411,12 @@ def end_round(
     if not row or not row["active"]:
         return {}
 
-    guess_count   = row["guess_count"]
-    uploader_id   = row["uploader_id"]
-    uploader_name = row["uploader_name"]
-    movie         = row["movie"]
-    round_id      = row["round_id"]
+    guess_count     = row["guess_count"]
+    uploader_id     = row["uploader_id"]
+    uploader_name   = row["uploader_name"]
+    uploader_avatar = row["uploader_avatar"]
+    movie           = row["movie"]
+    round_id        = row["round_id"]
 
     # Fetch wrong guessers before clearing
     wrong_guessers = db.execute(
@@ -458,6 +498,8 @@ def end_round(
     db.execute(
         "UPDATE round SET active=0, movie=NULL, uploader_id=NULL, uploader_name=NULL, "
         "uploader_avatar=NULL, released=0, reveal_at=NULL, lightning=0, guess_count=0, "
+        "uploaded_msg_id=NULL, countdown_msg_id=NULL, instructions_msg_id=NULL, started_at=NULL, "
+        "winner_deadline=NULL, pending_winner_id=NULL, "
         "last_uploader_id=?, round_id=? WHERE id=1",
         (uploader_id, new_round_id)
     )
@@ -467,6 +509,7 @@ def end_round(
         "movie":           movie,
         "uploader_id":     uploader_id,
         "uploader_name":   uploader_name,
+        "uploader_avatar": uploader_avatar,
         "winner_name":     winner_name,
         "solved":          solved,
         "solved_on":       solved_on_screenshot,
@@ -493,7 +536,6 @@ ntm = app_commands.Group(name="ntm", description="Name That Movie commands")
 @tasks.loop(minutes=1)
 async def scheduler():
     now = datetime.now(timezone.utc).timestamp()
-    log.info("Scheduler tick at %s", datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M:%S"))
 
     # ── Read phase: collect everything we need, then close the DB connection ──
     with get_db() as db:
@@ -506,9 +548,15 @@ async def scheduler():
         if channel is None:
             return
 
-        lightning     = bool(row["lightning"])
-        uploader_name = row["uploader_name"] or "Winner"
-        uploader_avatar = row["uploader_avatar"]
+        lightning        = bool(row["lightning"])
+        uploader_name    = row["uploader_name"] or "Winner"
+        uploader_avatar  = row["uploader_avatar"]
+        uploaded_msg_id  = row["uploaded_msg_id"]
+        countdown_msg_id = row["countdown_msg_id"]
+        started_at          = row["started_at"]
+        winner_deadline     = row["winner_deadline"]
+        pending_winner_id   = row["pending_winner_id"]
+        screenshots_uploaded = db.execute("SELECT COUNT(*) FROM screenshots").fetchone()[0]
 
         # Fetch all pending shots and pre-compute their seq numbers
         all_shots  = db.execute("SELECT * FROM screenshots ORDER BY schedule_at").fetchall()
@@ -532,9 +580,57 @@ async def scheduler():
         )
         recap = end_round(db, solved=False, winner_id=None, winner_name=None) if do_reveal else None
 
+        # Upload timeout — abort if not all screenshots uploaded in time
+        timeout_abort = False
+        if (
+            config.UPLOAD_TIMEOUT_ENABLED
+            and not recap
+            and started_at is not None
+            and screenshots_uploaded < 3
+            and (now - started_at) > config.UPLOAD_TIMEOUT_HOURS * 3600
+        ):
+            log.info("Upload timeout — aborting round after %.1fh with only %d/3 screenshots",
+                     (now - started_at) / 3600, screenshots_uploaded)
+            timeout_abort = True
+            recap = end_round(db, solved=False, winner_id=None, winner_name=None)
+
+        # Winner setup deadline — strip role and open free game if they haven't started
+        winner_timeout_abort = False
+        if (
+            config.WINNER_SETUP_TIMEOUT_ENABLED
+            and not row["active"]
+            and winner_deadline is not None
+            and now >= winner_deadline
+            and pending_winner_id is not None
+        ):
+            winner_timeout_abort = True
+            db.execute(
+                "UPDATE round SET winner_deadline=NULL, pending_winner_id=NULL WHERE id=1"
+            )
+            log.info("Winner setup timeout — opening free game")
+
     # ── Post phase: all Discord I/O happens outside the DB transaction ─────────
     for i, shot in enumerate(pending):
         seq = already_released + i + 1
+
+        # Delete the "all uploaded" message when screenshot 2 is posted
+        if seq == 2 and uploaded_msg_id:
+            try:
+                old_msg = await channel.fetch_message(uploaded_msg_id)
+                await old_msg.delete()
+                log.info("Deleted uploaded confirmation message")
+            except Exception as e:
+                log.warning("Could not delete uploaded msg: %s", e)
+
+        # Delete the countdown message when screenshot 3 is posted
+        if seq == 3 and countdown_msg_id:
+            try:
+                old_msg = await channel.fetch_message(countdown_msg_id)
+                await old_msg.delete()
+                log.info("Deleted countdown message")
+            except Exception as e:
+                log.warning("Could not delete countdown msg: %s", e)
+
         try:
             await post_screenshot_as_user(
                 channel=channel,
@@ -559,14 +655,64 @@ async def scheduler():
                 file=discord.File(shot["local_path"]),
             )
 
-    if recap:
+        # After screenshot 2: post countdown to screenshot 3
+        if seq == 2:
+            shot3_ts = None
+            for s in all_shots:
+                if not s["released"] and s["id"] != shot["id"]:
+                    shot3_ts = int(s["schedule_at"])
+                    break
+            shot3_str = f"<t:{shot3_ts}:R>" if shot3_ts else "soon"
+            countdown_msg = await channel.send(
+                f"🎬 Screenshot 3 drops {shot3_str}\n"
+                f"Use `/ntm guess <title>` to submit your answer!"
+            )
+            with get_db() as db:
+                db.execute(
+                    "UPDATE round SET countdown_msg_id=? WHERE id=1",
+                    (countdown_msg.id,)
+                )
+
+        # After screenshot 3: post final how-to-guess message
+        if seq == 3:
+            await channel.send(
+                "🎬 All screenshots are out — this is your last chance!\n"
+                "Use `/ntm guess <title>` to submit your answer!"
+            )
+
+    if winner_timeout_abort:
+        # Strip the winner role
+        guild = bot.get_guild(config.GUILD_ID)
+        if guild and pending_winner_id:
+            member = guild.get_member(pending_winner_id)
+            if member:
+                role = discord.utils.get(guild.roles, name=config.WINNER_ROLE_NAME)
+                if role and role in member.roles:
+                    await member.remove_roles(role, reason="NTM: winner setup timeout")
+        await channel.send(
+            f"⏰ The Winner didn't start a new round in time.\n"
+            f"🆓 **Free game!** Anyone can now start a round with `/ntm movie` — no Winner role needed!"
+        )
+        log.info("Winner setup timeout message posted")
+
+    if recap and timeout_abort:
+        await delete_instructions_msg(channel)
+        await channel.send(
+            f"⏰ **Round aborted!** The Winner didn't upload all screenshots in time.\n"
+            f"🆓 **Free game!** Anyone can start the next round with `/ntm movie` — no Winner role needed."
+        )
+        log.info("Upload timeout message posted")
+
+    elif recap:
         log.info("Auto-reveal triggered for movie: %r", recap["movie"])
+        await delete_instructions_msg(channel)
         await post_round_recap(
             channel=channel,
             movie=recap["movie"],
             solved=False,
             winner_name=None,
             uploader_name=recap["uploader_name"],
+            uploader_avatar=recap.get("uploader_avatar"),
             points=recap["points"],
             guess_count=recap["guess_count"],
             solved_on=None,
@@ -738,7 +884,7 @@ async def ntm_guess(interaction: discord.Interaction, title: str):
                 (row["round_id"], winner.id, winner.display_name, title),
             )
             await interaction.response.send_message(
-                f"Sorry, **{title}** is not correct. Keep guessing!", ephemeral=True
+                f"❌ **{winner.display_name}** guessed **{title}** — not quite! Keep trying. 🍿"
             )
             return
 
@@ -765,12 +911,14 @@ async def ntm_guess(interaction: discord.Interaction, title: str):
 
     channel = bot.get_channel(config.GAME_CHANNEL_ID)
     if channel and recap:
+        await delete_instructions_msg(channel)
         await post_round_recap(
             channel=channel,
             movie=recap["movie"],
             solved=True,
             winner_name=winner.display_name,
             uploader_name=recap["uploader_name"],
+            uploader_avatar=recap.get("uploader_avatar"),
             points=pts,
             guess_count=recap["guess_count"],
             solved_on=solved_on,
@@ -795,6 +943,20 @@ async def ntm_guess(interaction: discord.Interaction, title: str):
                 ]
                 await channel.send(random.choice(streak_msgs))
 
+        # Winner setup instructions and deadline
+        if config.WINNER_SETUP_TIMEOUT_ENABLED:
+            deadline_ts = int(datetime.now(timezone.utc).timestamp() + config.WINNER_SETUP_TIMEOUT_HOURS * 3600)
+            with get_db() as db:
+                db.execute(
+                    "UPDATE round SET winner_deadline=?, pending_winner_id=? WHERE id=1",
+                    (float(deadline_ts), winner.id)
+                )
+            await channel.send(
+                f"🎉 Congrats {winner.mention}! You're now the **{config.WINNER_ROLE_NAME}**.\n"
+                f"Start the next round by using `/ntm movie <title>` with your first screenshot attached.\n"
+                f"You have until <t:{deadline_ts}:R> to start a round — or it becomes free game for everyone!"
+            )
+
 
 # ── /ntm movie ────────────────────────────────────────────────────────────────
 
@@ -805,45 +967,62 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
         await interaction.response.send_message("Please use this command in the game channel.", ephemeral=True)
         return
 
+    # ── All validation runs synchronously so we can respond immediately ─────────
     with get_db() as db:
         row = get_round(db)
-
-        # In a free-game situation (no Winner role holder), anyone can start EXCEPT
-        # the person who just set the previous movie.
-        winner_role = discord.utils.get(interaction.guild.roles, name=config.WINNER_ROLE_NAME)
+        winner_role  = discord.utils.get(interaction.guild.roles, name=config.WINNER_ROLE_NAME)
         role_is_held = winner_role is not None and len(winner_role.members) > 0
         is_free_game = not role_is_held and (not row or not row["active"])
 
+        error = None
         if not is_winner(interaction) and not is_admin(interaction) and not is_free_game:
-            await interaction.response.send_message(
-                "Only the current Winner can set the movie.", ephemeral=True
-            )
-            return
-
-        if is_free_game and not is_admin(interaction):
+            error = "Only the current Winner can set the movie."
+        elif is_free_game and not is_admin(interaction):
             last_uploader_id = row["last_uploader_id"] if row else None
             if last_uploader_id and interaction.user.id == last_uploader_id:
-                await interaction.response.send_message(
-                    "You set the last movie — someone else needs to start this round. "
-                    "It's free game for everyone else!",
-                    ephemeral=True,
-                )
-                return
+                error = ("You set the last movie — someone else needs to start this round. "
+                         "It's free game for everyone else!")
+        elif row and row["active"]:
+            error = "A round is already in progress! It must end before starting a new one."
+        else:
+            allowed_ext  = {"jpg", "jpeg", "png", "gif", "webp"}
+            filename_ext = screenshot.filename.rsplit(".", 1)[-1].lower() if "." in screenshot.filename else ""
+            if (
+                not screenshot.content_type
+                or not screenshot.content_type.startswith("image")
+                or filename_ext not in allowed_ext
+                or screenshot.size > 8 * 1024 * 1024
+            ):
+                error = "Please attach a valid image (jpg, jpeg, png, gif or webp, max 8 MB)."
 
-        if row and row["active"]:
-            await interaction.response.send_message(
-                "A round is already in progress! It must end before starting a new one.", ephemeral=True
-            )
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
 
-        if not screenshot.content_type or not screenshot.content_type.startswith("image"):
-            await interaction.response.send_message(
-                "Please attach a valid image as the first screenshot.", ephemeral=True
-            )
-            return
+        # Compute round info while DB is still open
+        avatar_url    = interaction.user.display_avatar.url
+        uploader_name = interaction.user.display_name
+        prev_round_number = row["round_number"] if row else 0
+        round_number      = prev_round_number + 1
+        lightning         = (config.LIGHTNING_ROUNDS_ENABLED and random.random() < config.LIGHTNING_ROUND_PROBABILITY)
+        interval_hours = config.LIGHTNING_INTERVAL_HOURS if lightning else config.SCREENSHOT_INTERVAL_HOURS
+        reveal_hours   = config.LIGHTNING_REVEAL_HOURS   if lightning else config.REVEAL_AFTER_HOURS
+        interval_str   = (
+            f"{int(interval_hours * 60)} minutes" if lightning
+            else f"{int(interval_hours)} hours"
+        )
 
-        await interaction.response.defer(ephemeral=True)
+    # ── Respond immediately before any async work so no spinner appears ───────
+    _lightning_prefix = "⚡ Lightning round! " if lightning else ""
+    await interaction.response.send_message(
+        f"{_lightning_prefix}**Round #{round_number}** started — answer is **{title}**.\n"
+        f"Add screenshots 2 and 3 with `/ntm screenshot` (one at a time). "
+        f"Each drops **{interval_str}** after the previous one.",
+        ephemeral=True,
+    )
 
+    # ── Download and save screenshot ──────────────────────────────────────────
+    with get_db() as db:
         for f in db.execute("SELECT local_path FROM screenshots").fetchall():
             Path(f["local_path"]).unlink(missing_ok=True)
         db.execute("DELETE FROM screenshots")
@@ -852,35 +1031,20 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
         path = config.SHOTS_DIR / f"shot_{int(datetime.now(timezone.utc).timestamp())}_1.{ext}"
         await download_attachment(screenshot.url, path)
 
-        now           = datetime.now(timezone.utc).timestamp()
-        avatar_url    = interaction.user.display_avatar.url
-        uploader_name = interaction.user.display_name
-
-        # Determine round number and whether this is a lightning round
-        prev_round_number = row["round_number"] if row else 0
-        round_number      = prev_round_number + 1
-        lightning         = (config.LIGHTNING_ROUNDS_ENABLED and random.random() < config.LIGHTNING_ROUND_PROBABILITY)
-
-        interval_hours = config.LIGHTNING_INTERVAL_HOURS if lightning else config.SCREENSHOT_INTERVAL_HOURS
-        reveal_hours   = config.LIGHTNING_REVEAL_HOURS   if lightning else config.REVEAL_AFTER_HOURS
-
         db.execute(
             "INSERT INTO screenshots(local_path, schedule_at, released) VALUES(?,?,1)",
-            (str(path), now),
+            (str(path), datetime.now(timezone.utc).timestamp()),
         )
         db.execute("INSERT INTO movie_usage(movie, uploader_name) VALUES(?,?)", (title, uploader_name))
         db.execute(
             "UPDATE round SET active=1, movie=?, uploader_id=?, uploader_name=?, "
-            "uploader_avatar=?, released=1, reveal_at=NULL, round_number=?, lightning=?, guess_count=0 WHERE id=1",
-            (title, interaction.user.id, uploader_name, avatar_url, round_number, 1 if lightning else 0),
+            "uploader_avatar=?, released=1, reveal_at=NULL, round_number=?, lightning=?, guess_count=0, "
+            "started_at=?, winner_deadline=NULL, pending_winner_id=NULL WHERE id=1",
+            (title, interaction.user.id, uploader_name, avatar_url, round_number, 1 if lightning else 0,
+             datetime.now(timezone.utc).timestamp()),
         )
         log.info("Round #%d started by %s — movie: %r  lightning: %s",
                  round_number, uploader_name, title, lightning)
-
-    interval_str = (
-        f"{int(interval_hours * 60)} minutes" if lightning
-        else f"{int(interval_hours)} hours"
-    )
 
     channel = interaction.channel
     if lightning:
@@ -889,6 +1053,7 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
             f"Screenshots every **{int(interval_hours * 60)} minutes** — guess fast!"
         )
 
+    # ── Post screenshot ───────────────────────────────────────────────────────
     try:
         await post_screenshot_as_user(
             channel=channel,
@@ -912,12 +1077,7 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
             file=discord.File(str(path)),
         )
 
-    await interaction.followup.send(
-        f"{'⚡ Lightning round! ' if lightning else ''}Round #{round_number} started with **{title}** as the answer.\n\n"
-        f"Add screenshots 2 and 3 using `/ntm screenshot` (one at a time).\n"
-        f"Each will be released **{interval_str}** after the previous one.",
-        ephemeral=True,
-    )
+
 
 
 # ── /ntm screenshot ───────────────────────────────────────────────────────────
@@ -937,8 +1097,17 @@ async def ntm_screenshot(interaction: discord.Interaction, screenshot: discord.A
             )
             return
 
-        if not screenshot.content_type or not screenshot.content_type.startswith("image"):
-            await interaction.response.send_message("Please attach a valid image.", ephemeral=True)
+        allowed_ext = {"jpg", "jpeg", "png", "gif", "webp"}
+        filename_ext = screenshot.filename.rsplit(".", 1)[-1].lower() if "." in screenshot.filename else ""
+        if (
+            not screenshot.content_type
+            or not screenshot.content_type.startswith("image")
+            or filename_ext not in allowed_ext
+            or screenshot.size > 8 * 1024 * 1024
+        ):
+            await interaction.response.send_message(
+                "Please attach a valid image (jpg, jpeg, png, gif or webp, max 8 MB).", ephemeral=True
+            )
             return
 
         total = db.execute("SELECT COUNT(*) as c FROM screenshots").fetchone()["c"]
@@ -948,15 +1117,38 @@ async def ntm_screenshot(interaction: discord.Interaction, screenshot: discord.A
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-
         lightning      = bool(row["lightning"])
         interval_hours = config.LIGHTNING_INTERVAL_HOURS if lightning else config.SCREENSHOT_INTERVAL_HOURS
         reveal_hours   = config.LIGHTNING_REVEAL_HOURS   if lightning else config.REVEAL_AFTER_HOURS
+        instructions_msg_id = row["instructions_msg_id"]
 
         seq  = total + 1
         ext  = screenshot.filename.rsplit(".", 1)[-1] if "." in screenshot.filename else "png"
         path = config.SHOTS_DIR / f"shot_{int(datetime.now(timezone.utc).timestamp())}_{seq}.{ext}"
+        prev_time = db.execute("SELECT MAX(schedule_at) as t FROM screenshots").fetchone()["t"]
+
+    # ── Acknowledge interaction instantly ──────────────────────────────────────
+    _release_str = f"<t:{int((prev_time or datetime.now(timezone.utc).timestamp()) + interval_hours * 3600)}:R>"
+    if seq == 2:
+        _ack = f"✅ Screenshot 2/3 saved — it'll be posted {_release_str}. Add one more with `/ntm screenshot`."
+    else:
+        _ack = f"✅ Screenshot 3/3 saved — it'll be posted {_release_str}. All screenshots are queued!"
+    await interaction.response.send_message(_ack, ephemeral=True)
+
+    # Delete the instructions message when screenshot 2 is uploaded
+    if seq == 2 and instructions_msg_id:
+        channel = bot.get_channel(config.GAME_CHANNEL_ID)
+        if channel:
+            try:
+                old_msg = await channel.fetch_message(instructions_msg_id)
+                await old_msg.delete()
+                log.info("Deleted instructions message on screenshot 2 upload")
+            except Exception as e:
+                log.warning("Could not delete instructions message: %s", e)
+        with get_db() as db:
+            db.execute("UPDATE round SET instructions_msg_id=NULL WHERE id=1")
+
+    with get_db() as db:
         await download_attachment(screenshot.url, path)
 
         prev_time   = db.execute("SELECT MAX(schedule_at) as t FROM screenshots").fetchone()["t"]
@@ -974,17 +1166,7 @@ async def ntm_screenshot(interaction: discord.Interaction, screenshot: discord.A
         log.info("Screenshot %d/3 added, scheduled for %s",
                  seq, datetime.fromtimestamp(schedule_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
-    release_str = f"<t:{int(schedule_at)}:R>"
-    msg = f"Screenshot {seq}/3 added - it will be posted {release_str}."
-    if seq == 3:
-        msg += (f"\n\nAll 3 screenshots are queued! "
-                f"Auto-reveal is {reveal_hours}h after the last one if nobody guesses.")
-    else:
-        msg += f"\n\nAdd {3 - seq} more screenshot(s) with `/ntm screenshot`."
-
-    await interaction.followup.send(msg, ephemeral=True)
-
-    # Public confirmation once all screenshots are uploaded
+    # Public confirmation once all screenshots are uploaded (no ephemeral)
     if seq == 3:
         with get_db() as db:
             all_shots = db.execute(
@@ -996,11 +1178,17 @@ async def ntm_screenshot(interaction: discord.Interaction, screenshot: discord.A
         shot3_str = f"<t:{shot3_ts}:R>" if shot3_ts else "later"
         channel = bot.get_channel(config.GAME_CHANNEL_ID)
         if channel:
-            await channel.send(
+            uploaded_msg = await channel.send(
                 f"✅ **{interaction.user.display_name}** has uploaded all 3 screenshots!\n"
                 f"Screenshot 2 drops {shot2_str}, screenshot 3 {shot3_str}.\n"
                 f"Use `/ntm guess` to submit your answer — good luck! 🍿"
             )
+            with get_db() as db:
+                db.execute(
+                    "UPDATE round SET uploaded_msg_id=? WHERE id=1",
+                    (uploaded_msg.id,)
+                )
+
 
 
 # ── /ntm skip ─────────────────────────────────────────────────────────────────
@@ -1031,12 +1219,14 @@ async def ntm_skip(interaction: discord.Interaction):
 
     channel = bot.get_channel(config.GAME_CHANNEL_ID)
     if channel and recap:
+        await delete_instructions_msg(channel)
         await post_round_recap(
             channel=channel,
             movie=recap["movie"],
             solved=False,
             winner_name=None,
             uploader_name=recap["uploader_name"],
+            uploader_avatar=recap.get("uploader_avatar"),
             points=0,
             guess_count=recap["guess_count"],
             solved_on=None,
@@ -1384,6 +1574,7 @@ async def ntm_winner(interaction: discord.Interaction, member: discord.Member):
                 solved=False,
                 winner_name=None,
                 uploader_name=recap["uploader_name"],
+            uploader_avatar=recap.get("uploader_avatar"),
                 points=0,
                 guess_count=recap["guess_count"],
                 solved_on=None,

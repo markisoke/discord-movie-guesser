@@ -61,7 +61,23 @@ MONTHLY_LEADERBOARD_ENABLED: bool = True
 # Set to 0 to disable the wrong guesser list entirely
 MAX_WRONG_GUESSES_SHOWN: int = 5
 
-# ── Screenshot retention ──────────────────────────────────────────────────────
+# ── Winner setup timeout ──────────────────────────────────────────────────────
+
+# Set to True to open free game if the Winner doesn't start a round in time
+WINNER_SETUP_TIMEOUT_ENABLED: bool = True
+
+# Hours the Winner has to start a new round before it becomes free game
+WINNER_SETUP_TIMEOUT_HOURS: float = 1.0
+
+# ── Upload timeout ─────────────────────────────────────────────────────────────
+
+# Set to True to abort a round if the Winner doesn't upload all 3 screenshots in time
+UPLOAD_TIMEOUT_ENABLED: bool = True
+
+# Hours after the first screenshot before the round is aborted (if not all uploaded)
+UPLOAD_TIMEOUT_HOURS: float = 5/60
+
+# ── Screenshot retention ───────────────────────────────────────────────────────
 
 # How many completed rounds worth of screenshots to keep on disk
 SCREENSHOT_RETENTION_ROUNDS: int = 2
