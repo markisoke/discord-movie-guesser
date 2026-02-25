@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import config
+from PIL import Image
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -25,6 +26,39 @@ logging.getLogger("discord.client").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 
 log = logging.getLogger("ntm")
+
+# ── Image security ───────────────────────────────────────────────────────────
+
+MAGIC_BYTES: dict = {
+    "jpg":  [(0, b"\xff\xd8\xff")],
+    "jpeg": [(0, b"\xff\xd8\xff")],
+    "png":  [(0, b"\x89PNG\r\n\x1a\n")],
+    "gif":  [(0, b"GIF87a"), (0, b"GIF89a")],
+    "webp": [(0, b"RIFF"), (8, b"WEBP")],
+}
+
+def validate_image(path: Path, ext: str) -> tuple[bool, str]:
+    """Check magic bytes and verify image is openable with Pillow."""
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return False, "Could not read file."
+
+    # Check magic bytes
+    signatures = MAGIC_BYTES.get(ext.lower(), [])
+    for offset, sig in signatures:
+        if data[offset:offset + len(sig)] != sig:
+            return False, f"File header does not match a valid {ext.upper()} image."
+
+    # Verify with Pillow
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception:
+        return False, "Image appears to be corrupt or invalid."
+
+    return True, ""
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -1031,6 +1065,15 @@ async def ntm_movie(interaction: discord.Interaction, title: str, screenshot: di
         path = config.SHOTS_DIR / f"shot_{int(datetime.now(timezone.utc).timestamp())}_1.{ext}"
         await download_attachment(screenshot.url, path)
 
+        ok, reason = validate_image(path, ext)
+        if not ok:
+            path.unlink(missing_ok=True)
+            log.warning("Rejected image from %s: %s", interaction.user, reason)
+            await interaction.followup.send(
+                f"❌ Image rejected — {reason} Please try a different file.", ephemeral=True
+            )
+            return
+
         db.execute(
             "INSERT INTO screenshots(local_path, schedule_at, released) VALUES(?,?,1)",
             (str(path), datetime.now(timezone.utc).timestamp()),
@@ -1150,6 +1193,15 @@ async def ntm_screenshot(interaction: discord.Interaction, screenshot: discord.A
 
     with get_db() as db:
         await download_attachment(screenshot.url, path)
+
+        ok, reason = validate_image(path, ext)
+        if not ok:
+            path.unlink(missing_ok=True)
+            log.warning("Rejected image from %s: %s", interaction.user, reason)
+            await interaction.followup.send(
+                f"❌ Image rejected — {reason} Please try a different file.", ephemeral=True
+            )
+            return
 
         prev_time   = db.execute("SELECT MAX(schedule_at) as t FROM screenshots").fetchone()["t"]
         schedule_at = (prev_time or datetime.now(timezone.utc).timestamp()) + interval_hours * 3600

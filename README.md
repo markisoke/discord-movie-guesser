@@ -1,4 +1,4 @@
-# Name That Movie - Discord Bot
+# Name That Movie — Discord Bot
 
 A single-channel Discord game where the winner of each round sets a new movie by uploading
 3 screenshots. Screenshots are released automatically on a timer. Players guess using slash
@@ -32,11 +32,14 @@ their profile picture and username — rather than from the bot.
    > not working.
 
 6. Under **Bot Permissions** (appears once `bot` is ticked), select:
-   - **Text Permissions:** Send Messages, Attach Files, Read Message History, Add Reactions, Use Slash Commands, Manage Webhooks
+   - **Text Permissions:** Send Messages, Attach Files, Read Message History, Manage Messages, Use Slash Commands, Manage Webhooks
    - **Role Management:** Manage Roles
 
    > **Manage Webhooks** is required for screenshots to appear as if sent by the winner.
    > Without it the bot falls back to posting screenshots under its own name.
+   >
+   > **Manage Messages** is required for the bot to delete its own messages (countdowns,
+   > upload confirmations, etc.).
 
 7. Copy the generated URL at the bottom and open it in your browser to invite the bot to your server.
 
@@ -57,7 +60,7 @@ cp .env.example .env
 To get IDs: Enable Developer Mode in Discord (User Settings → Advanced),
 then right-click a server or channel and choose **Copy ID**.
 
-Game settings (timings, lightning rounds, weekly summary, etc.) are in `config.py`.
+Game settings (timings, lightning rounds, timeouts, etc.) are in `config.py`.
 
 ---
 
@@ -88,17 +91,19 @@ docker logs namethatmovie-bot --follow   # live stream
 
 1. The current `Winner` runs `/ntm movie The Dark Knight` with **screenshot 1 attached**.
    - Screenshot 1 is posted immediately via webhook, appearing as if sent by the winner.
-   - The winner receives an ephemeral confirmation with timing details.
+   - The winner receives an ephemeral confirmation with the answer, interval timing, and next steps.
 2. The winner runs `/ntm screenshot` twice to upload screenshots 2 and 3.
-   - A public message is posted once all 3 are uploaded, showing when each will drop.
-   - Each screenshot is released automatically by the bot on its scheduled time.
+   - Each receives an ephemeral confirmation showing when it will be released.
+   - Once all 3 are uploaded, a public message is posted showing when each screenshot will drop.
+   - When screenshot 2 posts, the upload confirmation is deleted and a countdown to screenshot 3 appears underneath.
+   - When screenshot 3 posts, the countdown is deleted and a final "last chance to guess" message appears.
 3. Players type `/ntm guess <title>` to submit guesses (case-insensitive).
-   - Wrong guesses are tracked and shown in the recap at the end of the round.
-4. The first correct guess wins — the guesser earns points and gets the `Winner` role.
-5. If nobody guesses in time, the bot auto-reveals the answer, posts a recap, and opens
-   a **free game** — anyone except the person who set the movie can start the next round.
-6. The winner can also use `/ntm skip` to give up early and reveal the answer themselves,
-   also triggering a free game.
+   - Wrong guesses are posted **publicly** so everyone can see what has been tried.
+   - Wrong guessers are tracked and listed in the recap at the end of the round.
+4. The first correct guess wins — the guesser earns points, gets the `Winner` role, and receives a public message with instructions and a deadline to start the next round.
+5. If the winner does not start a new round within the configured time, their role is stripped and a **free game** is opened — anyone can start the next round.
+6. If nobody guesses in time, the bot auto-reveals the answer, posts a recap, and opens a **free game** — anyone except the person who set the movie can start the next round.
+7. The winner can also use `/ntm skip` to give up early and reveal the answer themselves.
 
 ---
 
@@ -134,11 +139,13 @@ minimum streak with `HOT_STREAK_THRESHOLD`.
 
 ## ⚡ Lightning Rounds
 
-Each round has a **5% chance** of being a lightning round (configurable, or disable entirely):
+Each round has a configurable chance of being a lightning round (default 5%):
 - Screenshots release every **30 minutes** instead of 8 hours
 - Auto-reveal after **2 hours** instead of 48
 - The bot announces it at the start and screenshots are marked with ⚡
-- The probability is completely random — there's no fixed interval
+- The probability is completely random — there is no fixed interval
+
+Toggle with `LIGHTNING_ROUNDS_ENABLED`. Adjust the probability with `LIGHTNING_ROUND_PROBABILITY`.
 
 ---
 
@@ -150,7 +157,7 @@ posts a recap embed showing:
 - Which screenshot it was solved on and points awarded
 - Total guesses made
 - Up to `MAX_WRONG_GUESSES_SHOWN` unique players who guessed incorrectly
-- All available screenshots
+- All available screenshots posted via webhook as the setter's name/avatar
 
 If nobody guessed the movie, one of 22 randomly chosen funny messages is shown and the
 setter earns +1 point.
@@ -159,12 +166,30 @@ setter earns +1 point.
 
 ## Free Game
 
-When a round ends without anyone guessing (auto-reveal or skip), the bot announces a
-**free game**: anyone except the person who just set the movie can start the next round
-with `/ntm movie` — no Winner role required. This prevents the same person from setting
-back-to-back movies and keeps the game open when nobody holds the Winner role.
+A **free game** is triggered when:
+- A round ends with no correct guess (auto-reveal or skip)
+- The winner fails to start a new round within the setup timeout
+
+During a free game, anyone except the person who just set the movie can start the next
+round with `/ntm movie` — no Winner role required. This prevents the same person from
+setting back-to-back movies and keeps the game open when nobody holds the Winner role.
 
 Admins can always start a round regardless of free game rules.
+
+---
+
+## ⏰ Timeouts
+
+### Upload Timeout
+If the winner starts a round but does not upload all 3 screenshots within the configured
+time (`UPLOAD_TIMEOUT_HOURS`, default 1 hour), the round is automatically aborted and a
+free game is announced. Toggle with `UPLOAD_TIMEOUT_ENABLED`.
+
+### Winner Setup Timeout
+After winning a round, the new winner has a configurable amount of time
+(`WINNER_SETUP_TIMEOUT_HOURS`, default 1 hour) to start a new round with `/ntm movie`.
+If they do not, their Winner role is stripped, a free game message is posted, and anyone
+can start the next round. Toggle with `WINNER_SETUP_TIMEOUT_ENABLED`.
 
 ---
 
@@ -191,6 +216,18 @@ the top regardless of all-time history. View it with `/ntm monthly`. Toggle with
 
 ---
 
+## 🔒 Image Security
+
+All uploaded screenshots are validated at three levels before being accepted:
+
+1. **Content-type & extension** — must be one of `jpg`, `jpeg`, `png`, `gif`, `webp` and under 8 MB.
+2. **Magic bytes** — the actual file header bytes are checked against the declared format, so a renamed `.exe` or other file masquerading as an image is rejected immediately.
+3. **Pillow verification** — the image is opened and verified using the Pillow library, catching corrupt files and malformed image headers.
+
+Any file failing these checks is deleted immediately and the uploader receives an ephemeral error.
+
+---
+
 ## Command Reference
 
 | Command | Who | Description |
@@ -212,7 +249,7 @@ the top regardless of all-time history. View it with `/ntm monthly`. Toggle with
 
 ---
 
-## Configuration Files
+## Configuration Reference
 
 **`.env`** — secrets and Discord IDs (never commit this):
 
@@ -240,5 +277,9 @@ the top regardless of all-time history. View it with `/ntm monthly`. Toggle with
 | `WEEKLY_SUMMARY_HOUR` | `9` | Hour to post the summary (24h UTC) |
 | `MONTHLY_LEADERBOARD_ENABLED` | `True` | Track a separate monthly leaderboard |
 | `MAX_WRONG_GUESSES_SHOWN` | `5` | Max unique wrong guessers shown in the recap (0 to disable) |
+| `WINNER_SETUP_TIMEOUT_ENABLED` | `True` | Open free game if winner does not start a round in time |
+| `WINNER_SETUP_TIMEOUT_HOURS` | `1.0` | Hours winner has to start a new round before free game opens |
+| `UPLOAD_TIMEOUT_ENABLED` | `True` | Abort round if winner does not upload all screenshots in time |
+| `UPLOAD_TIMEOUT_HOURS` | `1.0` | Hours after round start before incomplete upload is aborted |
 | `SCREENSHOT_RETENTION_ROUNDS` | `2` | How many rounds of screenshots to keep on disk |
 | `LEADERBOARD_SIZE` | `10` | Number of players shown on leaderboards |
