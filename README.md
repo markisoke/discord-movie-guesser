@@ -1,3 +1,5 @@
+This project is vibe coded by Claude.
+
 # Name That Movie — Discord Bot
 
 A single-channel Discord game where the winner of each round sets a new movie by uploading
